@@ -1,0 +1,324 @@
+---
+title: "gj_code"
+output: github_document
+---
+# Evolution Mini Project
+
+## File setup
+```{r}
+# clearing world environment
+rm(list = ls())
+
+# R package loading
+library(tidyverse)
+
+# importing required rds file
+names <- readRDS("gj_wd/Names_1920to2015.rds")
+
+```
+
+## Data Wrangling
+
+```{r}
+# establishing number of individuals per year
+yearly <- names %>%
+  select(year, N_year_total) %>% unique()
+
+# establishing number of names present in 1920 (first year)
+names_1920 <- names %>%
+  filter(year == "1920")
+nrow(names_1920) # 4990 names in 1920
+
+# establishing number of names present in 2017 (final year)
+names_2017 <- names %>%
+  filter(year == "2017") %>% 
+  filter(N > 0)
+nrow(names_2017) # 2360 names in 2017
+
+# 30 most common names
+names_30common <- names %>%
+  group_by(name) %>%
+  summarize(N=sum(N)) %>%
+  arrange(desc(N)) %>%
+  ungroup() %>%
+  slice(1:30)
+keepnames <- names_30common$name
+```
+
+# Creating vectors
+These will go into the functions.
+```{r}
+# creating a vector of total names / year
+N_years <- setNames(yearly$N_year_total, yearly$year)
+
+# creating a vector of years
+years <- sort(unique(yearly$year))
+
+# creating a vector of starting frequencies
+f0 <- names_1920$freq
+```
+
+# Functions
+
+This step is to set up functions that will run the neutral model simulations. This is independent to the actual number of simulations run, allowing for flexibility in the model.
+
+## Summary stat calculation function (extinction rate)
+```{r}
+stats_summary <- function(df) {
+  
+  # names present in final year of simulation
+  sim_final_names <- df %>%
+    filter(year == max(year), N > 0) %>%
+    pull(name)
+  
+  # starting frequencies from simulation year 1
+  sim_start <- df %>%
+    filter(year == min(year)) %>%
+    select(name, N)
+  
+  # relative frequency
+  f0_sim <- sim_start$N / sum(sim_start$N)
+  
+  # EXPECTED EXTINCTION: present in 1920 but absent in final year
+  p_extinct <- as.numeric(!(sim_start$name %in% sim_final_names))
+  
+  # LASTYEAR: last year a name was seen
+  lastyear <- df %>%
+    group_by(name) %>%
+    summarise(lastyear = max(year[N > 0]), .groups = "drop") %>%
+    arrange(name) %>%
+    pull(lastyear)
+  
+  return(list(
+    f0 = f0_sim,
+    name = sim_start$name,
+    p_extinct = p_extinct,
+    lastyear = lastyear))
+}
+```
+
+## Run simulation function
+```{r}
+# creating a function to run 1000 simulations
+sim_run <- function() {
+  
+  # Creating first population in 1920
+  pop <- rep(names$name[names$year == years[1]],
+             names$N[names$year == years[1]])
+  
+  simulation_list <- list()
+  simulation_list[[1]] <- pop
+  
+  # Simulate populations from 1920 to 2017
+  for(i in 2:length(years)) {
+    pop <- sample(pop, size = N_years[as.character(years[i])],
+                  replace = TRUE)
+    simulation_list[[i]] <- pop}
+  
+  # Combining outputs into a vector
+  counts_list <- lapply(simulation_list, table)
+  
+  # Converting to data frame
+  sim_df <- purrr::map2_dfr(counts_list, years,
+    ~ tibble(year = .y, name = names(.x), N = as.numeric(.x)))
+  
+  sim_df}
+```
+
+# Running the simulation
+Run the specified number of simulations and collect observed extinctions. By changing `n_sims`, you can modify the simulations to your desired number of runs. 
+For this notebook simulation, N = 10. Full model (N = 1000 simulations) will be included as an RDS for loading later. 
+``` {r}
+n_sims <- 10
+sim_stats <- purrr::map(
+  seq_len(n_sims),
+  ~ stats_summary(sim_run()),
+  .progress = TRUE
+)
+# confirming simulations ran as expected
+length(sim_stats) # 10
+
+# extracting average expected & observed extinction across sampling simulations
+extinct_expected   <- rowMeans(sapply(sim_stats, `[[`, "p_extinct"))
+lastyear   <- rowMeans(sapply(sim_stats, `[[`, "lastyear"))
+extinct_observed <- as.numeric(!(names_1920$name %in% names_2017$name))
+
+# checking lengths
+length(extinct_expected) # 4990
+length(lastyear) # 4990
+length(extinct_observed) # 4990
+```
+
+# Simulation analysis
+
+## Extracting extinction rate (observed vs. expected extinctions)
+```{r}
+# overall comparison
+cat("Mean observed extinction:", round(mean(extinct_observed), 3), "\n")
+cat("Mean expected extinction:", round(mean(extinct_expected), 3), "\n")
+
+extinction_results <- data.frame(
+  name     = names_1920$name,
+  f0       = f0,
+  observed = extinct_observed,
+  expected = extinct_expected,
+  lastyear = lastyear)
+```
+
+## Combining extinction rates
+```{r}
+# Combining extinction rates (observed and expected) across years)
+extinction_over_time <- names %>%
+  group_by(name) %>%
+  summarise(endyear = max(year[N > 0]),  .groups = "drop") %>% # last year each name was present
+  filter(endyear < max(years)) %>%
+  group_by(endyear) %>%
+  summarise(n_extinct = n(), .groups = "drop") %>%
+  left_join(
+    names %>% group_by(year) %>% summarise(n_present = sum(N > 0), .groups = "drop"),
+    by = c("endyear" = "year")) %>%
+  mutate(obs_rate = (n_extinct / n_present)*100) # remove final year (can't distinguish extinction from censoring)
+
+expected_over_time <- extinction_results %>%
+  mutate(lastyear = round(lastyear)) %>%
+  filter(lastyear < max(years)) %>%
+  group_by(lastyear) %>%
+  summarise(n_extinct = n(), .groups = "drop") %>%
+  arrange(lastyear) %>%
+  mutate(n_present = 4990 - cumsum(lag(n_extinct, default = 0))) %>%
+  mutate(exp_rate = (n_extinct / n_present) * 100)
+
+extinction <- extinction_over_time %>%
+  left_join(expected_over_time, by = c("endyear" = "lastyear")) %>%
+  mutate(obs_rate = replace_na(obs_rate, 0),
+         exp_rate = replace_na(exp_rate, 0))
+```
+
+## Statistical tests
+#### Test 1: Overall test
+Are overall extinction rates different from Wright-Fisher model expectations?
+```{r test}
+# Binomial test comparing each name's observed vs. expected extinctions through 1920 - 2017
+binom <- binom.test(
+  x = round(sum(extinction_results$observed) * n_sims), # total extinctions across sims
+  n = nrow(extinction_results) * n_sims, # total name-sim pairs
+  p = mean(extinction_results$expected)) # WF expected rate
+p_binom <- binom$p.value # p-value = 6.916919e-323 for the 1000 simulations
+
+# Wilcoxon signed-rank test (non-parametric) comparing each year's observed vs. expected extinctions through 1920 - 2017
+# Remove years where exp_rate is NA or zero
+extinction_clean <- extinction %>%
+  filter(!is.na(exp_rate) & !is.na(obs_rate) & exp_rate > 0)
+
+wilcox.test(extinction_clean$obs_rate, extinction_clean$exp_rate, paired = TRUE)
+# p-value = 1.136e-15 for the 1000 simulations
+```
+
+#### Test 2: Logistic regression (GLMs)
+Does observed extinction deviate from expected, controlling for f0?
+```{r logistic}
+extinction_results$residual <- extinction_results$observed - extinction_results$expected
+
+# GLM (binomial) on each name's observed vs. expected extinctions through 1920 - 2017
+glm_fit <- glm(observed ~ expected + log(f0), 
+               data = extinction_results, 
+               family = binomial())
+summary_glmfit <- summary(glm_fit)
+p_reg <- summary_glmfit$coefficients[3,4] 
+p_reg # p-value = 7.495717e-166 for the 1000 simulations
+
+# GLM (Gaussian) on each year's observed vs. expected extinctions through 1920 - 2017
+glm_year <- glm(obs_rate ~ exp_rate + endyear, 
+               data = extinction, 
+               family = gaussian())
+summary_glmyear <- summary(glm_year)
+p_year <- summary_glmyear$coefficients[3,4]
+p_year # p-value = 0.002362611 for the 1000 simulations. for 10 simulations, may return as non-significant.
+
+```
+
+#### Test 3: Correlation
+Do names that the Wright-Fisher neutral model predict will go extinct actually go extinct?
+```{r correlation}
+# Test on each name
+cor.test(extinction_results$observed, extinction_results$expected, method = "spearman") 
+# # p-value = 0.434
+
+# Test on each year
+cor.test(extinction$obs_rate, extinction$exp_rate, method = "spearman") 
+# p-value = 3.845e-05
+```
+
+# Saving results
+```{r}
+# saving script for future usage
+results <- list(
+  sim_stats  = sim_stats,
+  extinction_results = extinction_results,
+  extinction = extinction,
+  n_sims      = n_sims)
+
+saveRDS(results, "namesim_results10.rds")
+```
+
+# Reading results
+```{r} 
+sim1000 <- readRDS("namesim_results1000.rds")
+extinction_results <- sim1000$extinction_results
+extinction <- sim1000$extinction
+n_sims <- sim1000$n_sims
+```
+
+# Plotting results
+
+#### Plot 1: By starting frequency bins (Extinction Rate by Starting Frequency) 
+```{r, echo=FALSE}
+extinction_results$freq_bin <- ntile(extinction_results$f0, 10)
+
+binned <- extinction_results %>%
+  group_by(freq_bin) %>%
+  summarise(obs  = (mean(observed)*100), exp  = (mean(expected)*100),
+            .groups = "drop") %>%
+  tidyr::pivot_longer(cols = c(obs, exp), names_to = "type", values_to = "extinction_rate")
+
+plot1 <- ggplot(binned, aes(x = freq_bin, y = extinction_rate, colour = type)) +
+  geom_line() +
+  scale_colour_manual(values = c("obs" = "steelblue", "exp" = "red"), 
+                      labels = c("obs" = "Observed", "exp" = "Neutral"), name = NULL) +
+  labs(x = "Starting frequency bin", y = "Mean extinction rate (%)",   tag = "a)") +
+  theme_classic(base_size = 18) +
+  theme(axis.title = element_text(size = 18), axis.text = element_text(size = 16),
+        legend.position = "inside", legend.position.inside = c(1.3, 0.2))
+plot1
+```
+
+#### Plot 2: Rate of extinction per year (observed vs. expected)
+```{r, echo=FALSE}
+# observed: calculate number of names going extinct per year
+plot2 <- ggplot(extinction, aes(x = endyear)) +
+  geom_line(aes(y = obs_rate, color = "Observed")) +
+  geom_line(aes(y = exp_rate, color = "Neutral")) +
+  scale_colour_manual(values = c("Observed" = "steelblue","Neutral" = "red"), name = NULL) +
+  labs(x = "Year", y = "Mean extinction rate (%)", tag = "b)") +
+  theme_classic(base_size = 18) +
+  theme(axis.title = element_text(size = 18), axis.text = element_text(size = 16),
+        legend.position = "outside", legend.position.inside = c(0.2, 0.2))
+plot2
+```
+
+#### Merging the plots into one panel
+```{r Plots}
+library(patchwork)
+library(cowplot)
+
+# remove legends from both plots
+plot1_noleg <- plot1 + theme(legend.position = "none")
+plot2_noleg <- plot2 + theme(legend.position = "none")
+
+# extract legend from plot1
+legend <- cowplot::get_legend(plot1)
+
+# combine with legend in middle
+plot1_noleg + legend + plot2_noleg +
+  plot_layout(widths = c(2, 0.1, 2))
+```
